@@ -1,24 +1,11 @@
 """
 =============================================================
   SIMULADOR DE CARRERA CON IA  -  Fase 1: Motor Base
-  Pygame + Sensores + Física del carro
-  
-  INSTRUCCIONES:
-  1. Instala dependencias:
-       pip install pygame pillow numpy
-  2. Pon este archivo en la MISMA carpeta que:
-       carrera.jpeg   (la pista)
-       carrito_.jpeg  (el carro)
-  3. Ejecuta:
-       python simulador_carrera.py
-  
-  CONTROLES MANUALES (para probar antes de la IA):
-       W / Flecha Arriba  → Acelerar
-       S / Flecha Abajo   → Frenar / Reversa
-       A / Flecha Izq     → Girar izquierda
-       D / Flecha Der     → Girar derecha
-       R                  → Reiniciar posición
-       ESC                → Salir
+  CONTROLES:
+       W / ↑   → Acelerar       S / ↓  → Frenar
+       A / ←   → Girar izq      D / →  → Girar der
+       C       → Ver/Ocultar contorno de pista
+       R       → Reiniciar      ESC    → Salir
 =============================================================
 """
 
@@ -27,322 +14,254 @@ import numpy as np
 import math
 import sys
 from PIL import Image
+from scipy.ndimage import binary_erosion, label
 
-# ─────────────────────────────────────────────
-#  CONFIGURACIÓN GENERAL
-# ─────────────────────────────────────────────
-ANCHO_VENTANA   = 800
-ALTO_VENTANA    = 800
-FPS             = 60
-TITULO          = "Simulador IA - Circuito de Carreras"
+ANCHO_VENTANA  = 1024
+ALTO_VENTANA   = 1024
+FPS            = 60
+TITULO         = "Simulador IA - Circuito de Carreras"
 
-# Colores utilitarios
-COLOR_SENSOR    = (0,   255,  0)    # verde  → sensor libre
-COLOR_PELIGRO   = (255,  80,  0)    # naranja → sensor cerca de borde
-COLOR_COLISION  = (255,   0,  0)    # rojo   → fuera de pista
-COLOR_HUD_BG    = (10,   10, 10)
+COLOR_SENSOR_OK = (0,  255,   0)
+COLOR_PELIGRO   = (255, 140,  0)
+COLOR_COLISION  = (255,   0,  0)
 COLOR_HUD_TEXT  = (220, 220, 220)
-COLOR_AMARILLO  = (255, 220,  50)
 
-# ─────────────────────────────────────────────
-#  DETECCIÓN DE PISTA  (por color de píxel)
-# ─────────────────────────────────────────────
-def construir_mascara_pista(ruta_imagen: str, ancho: int, alto: int) -> np.ndarray:
-    """
-    Retorna una matriz booleana: True = asfalto (pista), False = fuera.
-    Se basa en que el asfalto pixel-art es gris (canales R≈G≈B, tono frío).
-    """
-    img = Image.open(ruta_imagen).convert("RGB").resize((ancho, alto))
+START_X   = 610
+START_Y   = 430
+START_ANG = 270
+
+
+def construir_mascara(ruta, ancho, alto):
+    img = Image.open(ruta).convert("RGB").resize((ancho, alto))
     arr = np.array(img, dtype=np.float32)
     r, g, b = arr[:,:,0], arr[:,:,1], arr[:,:,2]
+    calidez = r - b
+    brillo  = (r + g + b) / 3.0
+    cruda   = (calidez < 20) & (brillo > 25) & (brillo < 165)
+    etiquetada, _ = label(cruda)
+    tamanios = np.bincount(etiquetada.ravel())
+    tamanios[0] = 0
+    region_pista = tamanios.argmax()
+    return etiquetada == region_pista
 
-    calidez    = r - b                          # tierra/pasto = cálido (>20)
-    brillo     = (r + g + b) / 3.0             # muy oscuro o muy claro = fuera
 
-    mascara = (calidez < 20) & (brillo > 40) & (brillo < 165)
-    return mascara  # shape (alto, ancho)
+def construir_contorno(mascara):
+    alto, ancho = mascara.shape
+    erosionada  = binary_erosion(mascara, iterations=3)
+    borde       = mascara & ~erosionada
+
+    surf = pygame.Surface((ancho, alto), pygame.SRCALPHA)
+    surf.fill((0, 0, 0, 0))   # todo transparente
+
+    # Acceder a los arrays de color y alpha por separado (funciona con SRCALPHA)
+    px_rgb   = pygame.surfarray.pixels3d(surf)       # shape (ancho, alto, 3)
+    px_alpha = pygame.surfarray.pixels_alpha(surf)   # shape (ancho, alto)
+
+    # Transponer mascaras de (alto,ancho) a (ancho,alto) para que coincidan
+    fuera_t = (~mascara).T
+    borde_t = borde.T
+
+    # Zona fuera de pista: rojo tenue
+    px_rgb[fuera_t, 0] = 180
+    px_rgb[fuera_t, 1] = 0
+    px_rgb[fuera_t, 2] = 0
+    px_alpha[fuera_t]  = 40
+
+    # Borde exacto: rojo brillante
+    px_rgb[borde_t, 0] = 255
+    px_rgb[borde_t, 1] = 30
+    px_rgb[borde_t, 2] = 30
+    px_alpha[borde_t]  = 220
+
+    # Liberar locks antes de retornar
+    del px_rgb, px_alpha
+
+    return surf
 
 
-# ─────────────────────────────────────────────
-#  CLASE: CARRO
-# ─────────────────────────────────────────────
 class Carro:
-    # ---- Física ----
-    ACELERACION     =  0.18
-    FRENADO         =  0.22
-    FRICCION        =  0.96   # multiplicador de velocidad cada frame
-    VELOCIDAD_MAX   =  5.5
-    VELOCIDAD_GIRO  =  3.2    # grados por frame a vel máx
-    LARGO_SENSOR    = 120     # píxeles de alcance de cada sensor
+    ACELERACION    = 0.18
+    FRENADO        = 0.22
+    FRICCION       = 0.96
+    VELOCIDAD_MAX  = 5.5
+    VELOCIDAD_GIRO = 3.2
+    LARGO_SENSOR   = 130
+    ANGULOS_SENSOR = [-90, -45, 0, 45, 90]
 
-    # Ángulos de los 5 sensores (relativo a la dirección del carro)
-    ANGULOS_SENSOR  = [-90, -45, 0, 45, 90]
+    def __init__(self, x, y, angulo, imagen):
+        self.x = float(x); self.y = float(y)
+        self.angulo = float(angulo); self.vel = 0.0
+        self.imagen_orig = imagen; self.imagen = imagen
+        self.rect = imagen.get_rect(center=(int(x), int(y)))
+        self.vivo = True; self.distancia = 0.0
+        self.lecturas = [self.LARGO_SENSOR] * len(self.ANGULOS_SENSOR)
 
-    def __init__(self, x: float, y: float, angulo: float, imagen: pygame.Surface):
-        # Posición y orientación
-        self.x       = x
-        self.y       = y
-        self.angulo  = angulo   # grados, 0 = derecha
-        self.vel     = 0.0      # velocidad actual
-
-        # Sprite original (sin rotar)
-        self.imagen_orig = imagen
-        self.imagen      = imagen
-        self.rect        = self.imagen.get_rect(center=(int(x), int(y)))
-
-        # Estado
-        self.vivo        = True
-        self.distancia   = 0.0  # distancia recorrida en pista
-        self.lecturas    = [self.LARGO_SENSOR] * len(self.ANGULOS_SENSOR)
-
-    # ── Movimiento ──────────────────────────────
-    def actualizar(self, teclas, mascara: np.ndarray):
+    def actualizar(self, teclas, mascara):
         if not self.vivo:
             return
-
-        # Entrada (manual O desde IA más adelante)
-        acelerando = teclas[pygame.K_w] or teclas[pygame.K_UP]
-        frenando   = teclas[pygame.K_s] or teclas[pygame.K_DOWN]
-        izquierda  = teclas[pygame.K_a] or teclas[pygame.K_LEFT]
-        derecha    = teclas[pygame.K_d] or teclas[pygame.K_RIGHT]
-
-        if acelerando:
-            self.vel += self.ACELERACION
-        if frenando:
-            self.vel -= self.FRENADO
-
-        self.vel  = max(-2.0, min(self.VELOCIDAD_MAX, self.vel))
+        acel = teclas[pygame.K_w] or teclas[pygame.K_UP]
+        fren = teclas[pygame.K_s] or teclas[pygame.K_DOWN]
+        izq  = teclas[pygame.K_a] or teclas[pygame.K_LEFT]
+        der  = teclas[pygame.K_d] or teclas[pygame.K_RIGHT]
+        if acel: self.vel += self.ACELERACION
+        if fren: self.vel -= self.FRENADO
+        self.vel = max(-2.0, min(self.VELOCIDAD_MAX, self.vel))
         self.vel *= self.FRICCION
-
-        # Giro proporcional a la velocidad (más velocidad → giro más ágil)
-        factor_giro = (abs(self.vel) / self.VELOCIDAD_MAX) * self.VELOCIDAD_GIRO
-        if izquierda:
-            self.angulo -= factor_giro
-        if derecha:
-            self.angulo += factor_giro
-
-        # Mover
+        giro = (abs(self.vel) / self.VELOCIDAD_MAX) * self.VELOCIDAD_GIRO
+        if izq: self.angulo -= giro
+        if der: self.angulo += giro
         rad = math.radians(self.angulo)
         nuevo_x = self.x + math.cos(rad) * self.vel
         nuevo_y = self.y + math.sin(rad) * self.vel
-
-        # Verificar colisión ANTES de mover
         nx, ny = int(nuevo_x), int(nuevo_y)
         alto, ancho = mascara.shape
         if 0 <= ny < alto and 0 <= nx < ancho:
-            if mascara[ny, nx]:          # es asfalto → moverse
-                self.x = nuevo_x
-                self.y = nuevo_y
+            if mascara[ny, nx]:
+                self.x = nuevo_x; self.y = nuevo_y
                 self.distancia += abs(self.vel)
-            else:                        # salió de pista
-                self.vel *= 0.5          # penalizar velocidad
-                # Permitir salir un poco pero marcar como muerto si es grave
-                self.vivo = False
+            else:
+                self.vel *= 0.4; self.vivo = False
         else:
             self.vivo = False
-
-        # Actualizar sprite rotado
-        self.imagen = pygame.transform.rotate(self.imagen_orig, -self.angulo-90)
-       
+        self.imagen = pygame.transform.rotate(self.imagen_orig, -self.angulo + 90)
         self.rect   = self.imagen.get_rect(center=(int(self.x), int(self.y)))
+        self._sensores(mascara)
 
-        # Actualizar sensores
-        self._actualizar_sensores(mascara)
-
-    # ── Sensores ─────────────────────────────────
-    def _actualizar_sensores(self, mascara: np.ndarray):
+    def _sensores(self, mascara):
         alto, ancho = mascara.shape
-        for i, offset_ang in enumerate(self.ANGULOS_SENSOR):
-            ang_rad  = math.radians(self.angulo + offset_ang)
-            distancia = self.LARGO_SENSOR   # distancia libre (máx)
-
+        for i, offset in enumerate(self.ANGULOS_SENSOR):
+            rad  = math.radians(self.angulo + offset)
+            dist = self.LARGO_SENSOR
             for d in range(1, self.LARGO_SENSOR + 1):
-                px = int(self.x + math.cos(ang_rad) * d)
-                py = int(self.y + math.sin(ang_rad) * d)
+                px = int(self.x + math.cos(rad) * d)
+                py = int(self.y + math.sin(rad) * d)
                 if not (0 <= py < alto and 0 <= px < ancho):
-                    distancia = d
-                    break
-                if not mascara[py, px]:  # encontró borde
-                    distancia = d
-                    break
+                    dist = d; break
+                if not mascara[py, px]:
+                    dist = d; break
+            self.lecturas[i] = dist
 
-            self.lecturas[i] = distancia
-
-    def get_inputs_ia(self) -> list:
-        """Devuelve las lecturas normalizadas [0..1] para la red neuronal."""
+    def get_inputs_ia(self):
         return [d / self.LARGO_SENSOR for d in self.lecturas]
 
-    # ── Dibujar ──────────────────────────────────
-    def dibujar(self, pantalla: pygame.Surface):
+    def dibujar(self, pantalla):
         if not self.vivo:
             return
-        # Carro
         pantalla.blit(self.imagen, self.rect)
-
-        # Sensores
-        for i, (offset_ang, distancia) in enumerate(zip(self.ANGULOS_SENSOR, self.lecturas)):
-            ang_rad = math.radians(self.angulo + offset_ang)
-            fin_x   = int(self.x + math.cos(ang_rad) * distancia)
-            fin_y   = int(self.y + math.sin(ang_rad) * distancia)
-
-            ratio = distancia / self.LARGO_SENSOR
-            if ratio > 0.5:
-                color = COLOR_SENSOR
-            else:
-                color = COLOR_PELIGRO
-
-            pygame.draw.line(pantalla, color, (int(self.x), int(self.y)), (fin_x, fin_y), 1)
-            pygame.draw.circle(pantalla, color, (fin_x, fin_y), 3)
+        for offset, dist in zip(self.ANGULOS_SENSOR, self.lecturas):
+            rad   = math.radians(self.angulo + offset)
+            fx    = int(self.x + math.cos(rad) * dist)
+            fy    = int(self.y + math.sin(rad) * dist)
+            color = COLOR_SENSOR_OK if dist / self.LARGO_SENSOR > 0.4 else COLOR_PELIGRO
+            pygame.draw.line(pantalla, color, (int(self.x), int(self.y)), (fx, fy), 1)
+            pygame.draw.circle(pantalla, color, (fx, fy), 3)
 
     def reiniciar(self, x, y, angulo):
-        self.x       = x
-        self.y       = y
-        self.angulo  = angulo
-        self.vel     = 0.0
-        self.vivo    = True
-        self.distancia = 0.0
-        self.lecturas  = [self.LARGO_SENSOR] * len(self.ANGULOS_SENSOR)
+        self.x = float(x); self.y = float(y)
+        self.angulo = float(angulo); self.vel = 0.0
+        self.vivo = True; self.distancia = 0.0
+        self.lecturas = [self.LARGO_SENSOR] * len(self.ANGULOS_SENSOR)
 
 
-# ─────────────────────────────────────────────
-#  HUD  (información en pantalla)
-# ─────────────────────────────────────────────
-def dibujar_hud(pantalla, fuente, carro, fps_real):
-    # Fondo translúcido
-    hud = pygame.Surface((220, 130), pygame.SRCALPHA)
-    hud.fill((10, 10, 10, 170))
-    pantalla.blit(hud, (8, 8))
-
+def dibujar_hud(pantalla, fuente, fuente_peq, carro, fps, contorno_on):
+    bg = pygame.Surface((250, 148), pygame.SRCALPHA)
+    bg.fill((10, 10, 10, 175))
+    pantalla.blit(bg, (8, 8))
     lineas = [
-        f"FPS       : {fps_real:.0f}",
-        f"Velocidad : {abs(carro.vel):.2f}",
-        f"Ángulo    : {carro.angulo % 360:.1f}°",
-        f"Distancia : {carro.distancia:.0f} px",
-        f"Sensores  : {[int(l) for l in carro.lecturas]}",
-        f"Estado    : {'EN PISTA' if carro.vivo else '💥 FUERA'}",
+        f"FPS        : {fps:.0f}",
+        f"Velocidad  : {abs(carro.vel):.2f}",
+        f"Angulo     : {carro.angulo % 360:.1f} grados",
+        f"Distancia  : {carro.distancia:.0f} px",
+        f"Sensores   : {[int(l) for l in carro.lecturas]}",
+        f"Estado     : {'EN PISTA' if carro.vivo else 'FUERA'}",
+        f"Contorno   : {'ON  [C]' if contorno_on else 'OFF [C]'}",
     ]
-    for i, linea in enumerate(lineas):
-        color = COLOR_HUD_TEXT if carro.vivo else COLOR_COLISION
-        if "FUERA" in linea:
-            color = COLOR_COLISION
-        surf = fuente.render(linea, True, color)
-        pantalla.blit(surf, (14, 14 + i * 19))
-
-def dibujar_titulo_controles(pantalla, fuente_peq):
-    info = "[W/S] Acelerar/Frenar  [A/D] Girar  [R] Reiniciar  [ESC] Salir"
-    surf = fuente_peq.render(info, True, (180, 180, 180))
-    pantalla.blit(surf, (ANCHO_VENTANA//2 - surf.get_width()//2, ALTO_VENTANA - 22))
-
-def dibujar_pantalla_colision(pantalla, fuente_grande, fuente):
-    overlay = pygame.Surface((ANCHO_VENTANA, ALTO_VENTANA), pygame.SRCALPHA)
-    overlay.fill((180, 0, 0, 80))
-    pantalla.blit(overlay, (0, 0))
-    txt  = fuente_grande.render("¡FUERA DE PISTA!", True, (255, 60, 60))
-    txt2 = fuente.render("Presiona  R  para reiniciar", True, (255, 220, 220))
-    pantalla.blit(txt,  (ANCHO_VENTANA//2 - txt.get_width()//2,  ALTO_VENTANA//2 - 30))
-    pantalla.blit(txt2, (ANCHO_VENTANA//2 - txt2.get_width()//2, ALTO_VENTANA//2 + 20))
+    for i, lin in enumerate(lineas):
+        color = (255, 80, 80) if "FUERA" in lin else COLOR_HUD_TEXT
+        pantalla.blit(fuente.render(lin, True, color), (14, 14 + i * 19))
+    ayuda = "[W/S] Accel/Freno   [A/D] Girar   [C] Contorno   [R] Reset   [ESC] Salir"
+    pantalla.blit(fuente_peq.render(ayuda, True, (150, 150, 150)),
+                  (ANCHO_VENTANA // 2 - 290, ALTO_VENTANA - 20))
 
 
-# ─────────────────────────────────────────────
-#  FUNCIÓN PRINCIPAL
-# ─────────────────────────────────────────────
+def dibujar_game_over(pantalla, fg, f):
+    ov = pygame.Surface((ANCHO_VENTANA, ALTO_VENTANA), pygame.SRCALPHA)
+    ov.fill((160, 0, 0, 70))
+    pantalla.blit(ov, (0, 0))
+    t1 = fg.render("FUERA DE PISTA!", True, (255, 60, 60))
+    t2 = f.render("Presiona  R  para reiniciar", True, (255, 210, 210))
+    pantalla.blit(t1, (ANCHO_VENTANA//2 - t1.get_width()//2, ALTO_VENTANA//2 - 30))
+    pantalla.blit(t2, (ANCHO_VENTANA//2 - t2.get_width()//2, ALTO_VENTANA//2 + 22))
+
+
 def main():
     pygame.init()
     pantalla = pygame.display.set_mode((ANCHO_VENTANA, ALTO_VENTANA))
     pygame.display.set_caption(TITULO)
-    reloj   = pygame.time.Clock()
+    reloj = pygame.time.Clock()
 
-    # ── Fuentes ──
-    fuente       = pygame.font.SysFont("Consolas", 14)
-    fuente_peq   = pygame.font.SysFont("Consolas", 12)
-    fuente_grande= pygame.font.SysFont("Consolas", 28, bold=True)
+    fuente     = pygame.font.SysFont("Consolas", 13)
+    fuente_peq = pygame.font.SysFont("Consolas", 11)
+    fuente_gde = pygame.font.SysFont("Consolas", 30, bold=True)
 
-    # ── Cargar pista ──
     try:
-        fondo_orig = pygame.image.load("carrera.jpeg").convert()
+        fondo = pygame.image.load("carrera.jpeg").convert()
+        fondo = pygame.transform.scale(fondo, (ANCHO_VENTANA, ALTO_VENTANA))
     except FileNotFoundError:
-        print("ERROR: No se encontró 'carrera.jpeg' en la carpeta actual.")
-        print("       Asegúrate de que el archivo esté junto a este script.")
-        sys.exit(1)
+        print("ERROR: No se encontro 'carrera.jpeg'"); sys.exit(1)
 
-    fondo = pygame.transform.scale(fondo_orig, (ANCHO_VENTANA, ALTO_VENTANA))
+    print("Analizando pista... espera un momento")
+    mascara = construir_mascara("carrera.jpeg", ANCHO_VENTANA, ALTO_VENTANA)
+    print(f"  Pista detectada: {100*mascara.sum()/(ANCHO_VENTANA*ALTO_VENTANA):.1f}%")
 
-    print("Construyendo máscara de pista... (puede tardar unos segundos)")
-    mascara = construir_mascara_pista("carrera.jpeg", ANCHO_VENTANA, ALTO_VENTANA)
-    print(f"  → Pista detectada: {100*mascara.sum()/(ANCHO_VENTANA*ALTO_VENTANA):.1f}% del área")
+    print("Generando contorno visual...")
+    contorno_surf = construir_contorno(mascara)
+    print("  Listo! Presiona C para mostrar/ocultar el contorno")
 
-    # ── Cargar carro ──
     try:
-        img_carro_orig = pygame.image.load("carrito_.jpeg").convert_alpha()
-    except FileNotFoundError:
-        # Si no carga con transparencia, intentar sin alpha
+        img_raw = pygame.image.load("carrito_.jpeg").convert_alpha()
+    except Exception:
         try:
-            img_carro_orig = pygame.image.load("carrito_.jpeg").convert()
+            img_raw = pygame.image.load("carrito_.jpeg").convert()
         except FileNotFoundError:
-            print("ERROR: No se encontró 'carrito_.jpeg' en la carpeta actual.")
-            sys.exit(1)
+            print("ERROR: No se encontro 'carrito_.jpeg'"); sys.exit(1)
 
-    # Escalar carro a tamaño apropiado para la pista
-    tam_carro = 35
-    img_carro = pygame.transform.scale(img_carro_orig, (35, 38))
-
-    # Hacer fondo gris del JPG transparente (el carrito tiene fondo gris claro)
+    img_carro = pygame.transform.scale(img_raw, (35, 38))
     img_carro = img_carro.convert_alpha()
-    arr_carro = pygame.surfarray.pixels3d(img_carro)
-    alpha_arr = pygame.surfarray.pixels_alpha(img_carro)
-    # Píxeles grises claros → transparentes
-    es_fondo = (
-        (arr_carro[:,:,0].astype(int) > 180) &
-        (arr_carro[:,:,1].astype(int) > 180) &
-        (arr_carro[:,:,2].astype(int) > 180) &
-        (np.abs(arr_carro[:,:,0].astype(int) - arr_carro[:,:,1].astype(int)) < 20) &
-        (np.abs(arr_carro[:,:,1].astype(int) - arr_carro[:,:,2].astype(int)) < 20)
+    ac = pygame.surfarray.pixels3d(img_carro)
+    aa = pygame.surfarray.pixels_alpha(img_carro)
+    fondo_gris = (
+        (ac[:,:,0].astype(int) > 175) &
+        (ac[:,:,1].astype(int) > 175) &
+        (ac[:,:,2].astype(int) > 175) &
+        (np.abs(ac[:,:,0].astype(int) - ac[:,:,1].astype(int)) < 25) &
+        (np.abs(ac[:,:,1].astype(int) - ac[:,:,2].astype(int)) < 25)
     )
-    alpha_arr[es_fondo] = 0
-    del arr_carro, alpha_arr  # liberar locks
-
-    # ── Posición inicial del carro (entrada de pista, lado derecho) ──
-    # Ajusta estos valores si el carro aparece fuera de la pista
-    START_X    = 610
-    START_Y    = 430
-    START_ANG  = 270   # apuntando hacia arriba
+    aa[fondo_gris] = 0
+    del ac, aa
 
     carro = Carro(START_X, START_Y, START_ANG, img_carro)
+    mostrar_contorno = True
 
-    # ─────────────────────────────────────────
-    #  LOOP PRINCIPAL
-    # ─────────────────────────────────────────
     ejecutando = True
     while ejecutando:
-        dt = reloj.tick(FPS)
+        reloj.tick(FPS)
         fps_real = reloj.get_fps()
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT: ejecutando = False
+            if ev.type == pygame.KEYDOWN:
+                if ev.key == pygame.K_ESCAPE: ejecutando = False
+                if ev.key == pygame.K_r:      carro.reiniciar(START_X, START_Y, START_ANG)
+                if ev.key == pygame.K_c:      mostrar_contorno = not mostrar_contorno
 
-        # ── Eventos ──
-        for evento in pygame.event.get():
-            if evento.type == pygame.QUIT:
-                ejecutando = False
-            if evento.type == pygame.KEYDOWN:
-                if evento.key == pygame.K_ESCAPE:
-                    ejecutando = False
-                if evento.key == pygame.K_r:
-                    carro.reiniciar(START_X, START_Y, START_ANG)
-
-        # ── Actualizar ──
-        teclas = pygame.key.get_pressed()
-        carro.actualizar(teclas, mascara)
-
-        # ── Dibujar ──
-        pantalla.blit(fondo, (0, 0))    # 1. Pista de fondo
-        carro.dibujar(pantalla)         # 2. Carro + sensores
-
-        # 3. HUD
-        dibujar_hud(pantalla, fuente, carro, fps_real)
-        dibujar_titulo_controles(pantalla, fuente_peq)
-
-        # 4. Overlay de colisión
+        carro.actualizar(pygame.key.get_pressed(), mascara)
+        pantalla.blit(fondo, (0, 0))
+        if mostrar_contorno:
+            pantalla.blit(contorno_surf, (0, 0))
+        carro.dibujar(pantalla)
+        dibujar_hud(pantalla, fuente, fuente_peq, carro, fps_real, mostrar_contorno)
         if not carro.vivo:
-            dibujar_pantalla_colision(pantalla, fuente_grande, fuente)
-
+            dibujar_game_over(pantalla, fuente_gde, fuente)
         pygame.display.flip()
 
     pygame.quit()
